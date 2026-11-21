@@ -1,3 +1,4 @@
 numpy>=1.24
+numba>=0.59                  # compiles the HNSW graph loops
 sentence-transformers>=2.2   # cli.py, real_benchmark.py
 datasets>=2.0               # real_benchmark.py (first run only, builds the data/ cache)

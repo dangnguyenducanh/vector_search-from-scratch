@@ -1,4 +1,4 @@
-# tests for the engine: python -m pytest -q   (or python test_engine.py)
+# tests for the engine: python -m pytest -q   (or python test_engine.py); HNSW_BACKEND=cpp runs them on the C++ kernels
 import os
 import tempfile
 

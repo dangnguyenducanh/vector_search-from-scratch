@@ -2,7 +2,9 @@
 
 The graph lives in flat int32 arrays and the hot loops (beam search, neighbor
 selection, insert, delete repair) are compiled with Numba. No ANN library.
+HNSWIndex(backend="cpp") runs the same loops ported to C++ (cpp/hnsw.cpp).
 """
+import ctypes
 import heapq
 import json
 import math
@@ -345,6 +347,35 @@ def _repair(vecs, g, levels, dead, visited, tag, entry, n, M, M0, efc):
     return tag
 
 
+# --- optional C++ kernels: cpp/hnsw.cpp, build with `make -C cpp` -------------
+# They work in place on the same arrays, so save/load, filters and the planner are shared.
+_CPP_ARRAYS = ("vecs", "l0", "c0", "up", "cu", "slot", "levels", "_visited", "dead")
+_CPP_DTYPES = (np.float32, np.int32, np.int32, np.int32, np.int32, np.int32, np.int32, np.int64, np.bool_)
+_cpp = None
+
+
+class _Graph(ctypes.Structure):  # field order must match struct Graph in cpp/hnsw.cpp
+    _fields_ = ([(a, ctypes.c_void_p) for a in _CPP_ARRAYS]
+                + [(a, ctypes.c_int64) for a in ("dim", "M", "M0", "depth")])
+
+
+def _load_cpp():
+    global _cpp
+    if _cpp is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cpp", "libhnsw.so")
+        try:
+            lib = ctypes.CDLL(path)
+        except OSError as e:
+            raise ImportError(f"{path} not built: run `make -C cpp` ({e})") from None
+        vp, i32, i64 = ctypes.c_void_p, ctypes.c_int32, ctypes.c_int64
+        lib.hnsw_insert.argtypes, lib.hnsw_insert.restype = [vp, i64, vp, i32, i32, i32], i64
+        lib.hnsw_query.argtypes = [vp, i64, i32, vp, ctypes.c_int, ctypes.c_int, vp, vp, vp]
+        lib.hnsw_query.restype = ctypes.c_int
+        lib.hnsw_repair.argtypes, lib.hnsw_repair.restype = [vp, i64, i32, i32, i32], i64
+        _cpp = lib
+    return _cpp
+
+
 class HNSWIndex(_Store):
     """Hierarchical Navigable Small World graph over the vector store.
 
@@ -355,11 +386,17 @@ class HNSWIndex(_Store):
     """
 
     exact_cost = 10
+    backend = os.environ.get("HNSW_BACKEND", "numba")  # "cpp": the same kernels in C++
 
-    def __init__(self, dim, M=16, ef_construction=100, seed=0):
+    def __init__(self, dim, M=16, ef_construction=100, seed=0, backend=None):
         dim, M, ef_construction = int(dim), int(M), int(ef_construction)  # numpy ints break save()
         if M < 2 or ef_construction < 1:
             raise ValueError("need M >= 2 and ef_construction >= 1")
+        self.backend = backend or self.backend
+        if self.backend not in ("numba", "cpp"):
+            raise ValueError("backend must be 'numba' or 'cpp'")
+        if self.backend == "cpp":
+            self._lib = _load_cpp()
         super().__init__(dim)
         self.M, self.M0 = M, 2 * M  # layer 0 is denser, as in the paper
         self.ef_construction = ef_construction
@@ -375,9 +412,22 @@ class HNSWIndex(_Store):
         self.n_up = 0
         self._visited = np.zeros(0, np.int64)  # visited[x] == tag  <=>  seen in this search
         self._tag = 0
+        self._bind()
 
     def _g(self):
         return self.l0, self.c0, self.up, self.cu, self.slot
+
+    def _bind(self):
+        """C++ backend: pointers into the arrays. Redone after any of them is reallocated."""
+        if self.backend != "cpp":
+            return
+        for a, dt in zip(_CPP_ARRAYS, _CPP_DTYPES):
+            arr = getattr(self, a)
+            if arr.dtype != dt or not arr.flags.c_contiguous:  # the C++ side assumes both
+                raise TypeError(f"{a}: need C-contiguous {np.dtype(dt)}, got {arr.dtype}")
+        self._graph = _Graph(*[getattr(self, a).ctypes.data for a in _CPP_ARRAYS],
+                             self.dim, self.M, self.M0, self.up.shape[1])
+        self._graph_ptr = ctypes.addressof(self._graph)
 
     def _grow(self, extra):
         super()._grow(extra)
@@ -405,6 +455,13 @@ class HNSWIndex(_Store):
             self.cu = np.pad(self.cu, ((0, more_rows), (0, more_depth)))
         self.slot[hi] = np.arange(self.n_up, self.n_up + len(hi))
         self.n_up += len(hi)
+        self._bind()
+        if self.backend == "cpp":
+            entry = ctypes.c_int32(self.entry)
+            self._tag = self._lib.hnsw_insert(self._graph_ptr, self._tag, ctypes.addressof(entry),
+                                              rows.start, rows.stop, self.ef_construction)
+            self.entry = entry.value
+            return
         self.entry, self._tag = _insert(self.vecs, self._g(), self.levels, self._visited, self._tag,
                                         self.entry, rows.start, rows.stop, self.M, self.M0,
                                         self.ef_construction)
@@ -422,6 +479,12 @@ class HNSWIndex(_Store):
             if len(ids) * len(ids) < self.exact_cost * max(ef, k) * len(self):
                 return [(int(ids[i]), s) for i, s in topk(self.vecs[ids] @ q, k)]
         self._tag += 1
+        if self.backend == "cpp":
+            ids, scores = np.empty(k, np.int32), np.empty(k, np.float32)
+            got = self._lib.hnsw_query(self._graph_ptr, self._tag, self.entry, q.ctypes.data, k, ef,
+                                       allow.ctypes.data if len(allow) else None,
+                                       ids.ctypes.data, scores.ctypes.data)
+            return list(zip(ids[:got].tolist(), scores[:got].tolist()))
         ids, scores = _query(self.vecs, self._g(), self.levels, self._visited, self._tag,
                              self.entry, q, k, ef, allow)
         return list(zip(ids.tolist(), scores.tolist()))
@@ -440,6 +503,9 @@ class HNSWIndex(_Store):
         if self.dead[self.entry]:  # new entry: the highest live node
             live = np.flatnonzero(~self.dead[: self.n])
             self.entry = int(live[np.argmax(self.levels[live])])
+        if self.backend == "cpp":
+            self._tag = self._lib.hnsw_repair(self._graph_ptr, self._tag, self.entry, self.n, self.ef_construction)
+            return
         self._tag = _repair(self.vecs, self._g(), self.levels, self.dead, self._visited, self._tag,
                             self.entry, self.n, self.M, self.M0, self.ef_construction)
 
@@ -459,16 +525,17 @@ class HNSWIndex(_Store):
         os.replace(tmp, path)  # atomic: a failed save never clobbers the previous file
 
     @classmethod
-    def load(cls, path):
+    def load(cls, path, backend=None):
         z = np.load(path, allow_pickle=False)
         meta = json.loads(str(z["meta"]))
-        idx = cls(meta["dim"], M=meta["M"], ef_construction=meta["ef_construction"])
+        idx = cls(meta["dim"], M=meta["M"], ef_construction=meta["ef_construction"], backend=backend)
         for a, dtype in cls.ARRAYS.items():
             setattr(idx, a, np.ascontiguousarray(z[a], dtype=dtype))
         idx.n, idx.n_up, idx.n_dead = len(idx.vecs), len(idx.up), int(idx.dead.sum())
         idx._visited = np.zeros(idx.n, np.int64)
         idx.payloads, idx.entry = meta["payloads"], int(meta["entry"])
         idx._check()
+        idx._bind()
         return idx
 
     def _check(self):

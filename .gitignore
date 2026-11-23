@@ -2,3 +2,5 @@ data/
 __pycache__/
 *.npz
 .pytest_cache/
+*.so
+cpp/hnsw_bench

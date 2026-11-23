@@ -1,5 +1,8 @@
 # vector_search-from-scratch
 
+> **Branch `experiment/cpp-backend`.** Same engine as `main`, plus the HNSW loops ported to C++ (`cpp/`) as an
+> opt-in backend. Result: same graph and recall, **not faster** than Numba. Write-up in [CPP_BACKEND.md](CPP_BACKEND.md).
+
 Semantic search engine with an exact index and an HNSW index written from scratch in Python. NumPy stores the vectors and runs exact search, and Numba compiles the graph loops.
 It supports deletes and metadata filters. There is no FAISS, no hnswlib and no vector DB; the only model is the sentence encoder that turns text into vectors.
 
@@ -20,6 +23,11 @@ python real_benchmark.py                                       # AG News 10k/50k
 python real_benchmark.py 120000 --filters --deletes            # filtered search + delete/repair tables
 python recall_benchmark.py --ref ../vector-search-engine       # reference repo's eval, both engines
 python real_benchmark.py 10000 --ref ../vector-search-engine   # AG News 10k, both engines
+
+make -C cpp                                                    # C++ backend: builds cpp/libhnsw.so
+HNSW_BACKEND=cpp python test_engine.py                         # the same tests on the C++ kernels
+python cpp_benchmark.py                                        # Numba vs C++ on AG News 120k
+python cpp_benchmark.py --export && make -C cpp bench && ./cpp/hnsw_bench data   # C++ only, no Python
 ```
 
 ```python
@@ -169,6 +177,9 @@ vector_search-from-scratch/
 ├── recall_benchmark.py  # the reference repo's eval protocol on both engines (--ref)
 ├── test_engine.py       # unit tests (python -m pytest -q, or python test_engine.py)
 ├── cli.py               # build an index from a text file, search it
+├── cpp/hnsw.cpp         # the HNSW loops ported to C++ (HNSWIndex(backend="cpp")); cpp/bench.cpp = C++-only benchmark
+├── cpp_benchmark.py     # Numba vs C++: parity, latency, build, deletes
+├── CPP_BACKEND.md       # C++ experiment: plan, eval, results
 ├── examples/products.txt
 ├── requirements.txt
 └── README.md
@@ -180,6 +191,24 @@ vector_search-from-scratch/
 - Multi-threaded build. The compiled loops run on one core.
 - Vector compression (PQ / int8).
 - Connectivity checks on insert. Like the paper and hnswlib, insert can leave a rare unreachable node; `delete()` fixes those too.
+
+## C++ backend (experiment, not faster)
+
+`cpp/hnsw.cpp` ports every Numba kernel to C++ (insert, beam search, neighbor selection, delete repair).
+`make -C cpp` builds it, and `HNSWIndex(dim, backend="cpp")` (or `HNSW_BACKEND=cpp`) runs it on the same arrays,
+so save/load, filters and the planner are shared. AG News 120k, 1 core, measured on a busy shared host:
+
+| | Numba | C++ |
+|---|---:|---:|
+| recall@10, ef = 16 / 32 / 64 / 128 | 0.917 / 0.960 / 0.982 / 0.994 | 0.917 / 0.960 / 0.982 / 0.994 |
+| tests (also ASan + UBSan for C++) | 11/11 | 11/11 |
+| query, ef=64, kernel only (best of 20) | 233–254 µs | 248–301 µs |
+| query, ef=64, through `search()` | 340 µs | 461 µs |
+
+Same graph (99.8% of layer-0 links identical), same recall, no speedup. Numba already compiles these loops
+with LLVM, and the walk is bound by memory reads (one random 1.5 KB vector per hop), not by the language.
+That is why `main` keeps Numba only. Plan, eval and what would actually help (int8 vectors) are in
+[CPP_BACKEND.md](CPP_BACKEND.md).
 
 ## Stack
 
